@@ -1121,31 +1121,39 @@ function csMetadata(html, kind) {
 
 function csSeriesCandidates(html, title, year) {
   const candidates = [];
+  // La pagina contiene anche suggerimenti nella sidebar: isoliamo le card
+  // dei risultati, prima della paginazione della ricerca.
+  const resultStart = html.indexOf('class="row mtl mbl"');
+  const pagination = html.indexOf('<ul class="pagination serie-tv', resultStart);
+  if (resultStart < 0 || pagination < 0) return candidates;
+  const resultsHtml = html.slice(resultStart, pagination);
+  const cards = /<a\b([^>]*\bclass=["'][^"']*\bcards\b[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
   const seen = new Set();
-  // Diagnostic: accept only real series detail URLs, never article or news URLs.
-  const anchors = [...html.matchAll(/<a\b[^>]*href=["'][^"']*\/serietv\/[^"']+\/scheda\/?["'][^>]*>/gi)];
-  for (const anchor of anchors) {
-    const href = getAttr(anchor[0], "href");
+  for (const match of resultsHtml.matchAll(cards)) {
+    const href = getAttr("<a " + match[1] + ">", "href");
     let parsed;
     try { parsed = new URL(href, CS_BASE); } catch { continue; }
     if (parsed.hostname !== "www.comingsoon.it" ||
       !/^\/serietv\/[^/]+\/\d+\/scheda\/?$/i.test(parsed.pathname) ||
       seen.has(parsed.pathname)) continue;
     seen.add(parsed.pathname);
-    const context = html.slice(anchor.index, Math.min(html.length, anchor.index + 3500));
-    const titleMatch = context.match(/<div\b[^>]*class=["'][^"']*\btitolo\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
-    const label = titleMatch ? cleanText(titleMatch[1]) :
-      cleanText(context.match(/<h[234]\b[^>]*>([\s\S]*?)<\/h[234]>/i)?.[1] || "");
-    const yearMatch = context.match(/(?:Anno\s*:?\s*(?:<\/[^>]+>\s*)*)\b(19\d{2}|20\d{2})\b/i);
+    const fragment = match[2];
+    const titleMatch = fragment.match(/<div\b[^>]*class=["'][^"']*\btitolo\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+    const originalMatch = fragment.match(/<div\b[^>]*class=["'][^"']*\bdescrizione\b[^"']*["'][^>]*>\s*\(\s*([\s\S]*?)\s*\)\s*<\/div>/i);
+    const yearMatch = fragment.match(/<b>\s*Anno:\s*<\/b>\s*<span>\s*(\d{4})\s*<\/span>/i);
+    const label = titleMatch ? cleanText(titleMatch[1]) : "";
+    const originalTitle = originalMatch ? cleanText(originalMatch[1]) : null;
     const foundYear = yearMatch ? Number(yearMatch[1]) : null;
-    const exactTitle = normalize(label) === normalize(title);
+    const exactTitle = normalize(label) === normalize(title) ||
+      (originalTitle && normalize(originalTitle) === normalize(title));
     const yearMatches = year === null || foundYear === year;
     candidates.push({
-      title: label || null, year: foundYear,
+      title: label || null, originalTitle, year: foundYear,
       id: parsed.pathname.match(/\/(\d+)\/scheda\/?$/)?.[1] || null,
       detailUrl: parsed.href,
       streamingUrl: parsed.href.replace(/\/scheda\/?$/i, "/streaming/"),
-      exactTitle, yearMatches, match: exactTitle && yearMatches
+      exactTitle: Boolean(exactTitle), yearMatches,
+      match: Boolean(exactTitle && yearMatches)
     });
   }
   return candidates;
@@ -1194,14 +1202,16 @@ async function testComingSoonSeriesSearch(url) {
   }
   const search = new URL("/serietv/ricerca/", CS_BASE);
   search.searchParams.set("titolo", title);
+  if (year !== null) search.searchParams.set("anno", String(year));
   const page = await fetchHtml(search.href);
   const candidates = csSeriesCandidates(page.html,title,year);
+  const resultCount = Number(page.html.match(/data-count=["\'](\d+)["\']/i)?.[1] || 0);
   const selected = candidates.find(x => x.match) || null;
   return {httpStatus:200,body:{
     status:selected ? "found_exact" : "unverified_search",
     provider:"ComingSoon Native Series Search (diagnostic)",
     title,year,searchPageUrl:search.href,searchPageHttp:page.http,
-    htmlLength:page.html.length,candidates,selected,
+    htmlLength:page.html.length,resultCount,candidates,selected,
     message:selected ? "Corrispondenza esatta trovata; verificare la scheda." :
       "Parametri o struttura HTML della ricerca serie da verificare. Nessuna associazione automatica."
   }};
