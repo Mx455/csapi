@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "now-api-test",
+  "name": "csapi",
   "main": "worker.js",
   "compatibility_date": "2026-11-09",
   "workers_dev": true
