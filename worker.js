@@ -970,116 +970,89 @@ function comingSoonSearchCandidate(item, type, title, year) {
   };
 }
 
+function extractNativeFilmCandidates(html, title, year) {
+  const candidates = [];
+  const seen = new Set();
+  const cards = /<a\b([^>]*\bclass=["'][^"']*\bcards\b[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
+  for (const match of html.matchAll(cards)) {
+    const href = getAttr("<a " + match[1] + ">", "href");
+    if (!href) continue;
+    let parsed;
+    try { parsed = new URL(href, CS_BASE); } catch { continue; }
+    if (parsed.hostname !== "www.comingsoon.it" ||
+        !/^\/film\/[^/]+\/\d+\/scheda\/?$/i.test(parsed.pathname) ||
+        seen.has(parsed.pathname)) continue;
+    const fragment = match[2];
+    const heading = fragment.match(/<div\b[^>]*class=["'][^"']*\btitolo\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+    if (!heading) continue;
+    const candidateTitle = cleanText(heading[1]);
+    const yearMatch = fragment.match(/<b>\s*Anno:\s*<\/b>\s*<span>\s*(\d{4})\s*<\/span>/i);
+    const candidateYear = yearMatch ? Number(yearMatch[1]) : null;
+    const exactTitle = normalize(candidateTitle) === normalize(title);
+    const yearMatches = year === null || candidateYear === year;
+    const id = parsed.pathname.match(/\/(\d+)\/scheda\/?$/)?.[1] || null;
+    seen.add(parsed.pathname);
+    candidates.push({
+      title: candidateTitle,
+      year: candidateYear,
+      id,
+      detailUrl: parsed.href,
+      streamingUrl: parsed.href.replace(/\/scheda\/?$/i, "/streaming/"),
+      exactTitle,
+      yearMatches,
+      match: exactTitle && yearMatches
+    });
+  }
+  return candidates;
+}
+
 async function testComingSoonSearch(url) {
   const title = (url.searchParams.get("title") || "").trim();
   const type = (url.searchParams.get("type") || "film").toLowerCase();
   const yearText = url.searchParams.get("year");
   const year = yearText ? Number(yearText) : null;
-
   if (!title || title.length > 180 || !["film", "serietv"].includes(type) ||
       (year !== null && (!Number.isInteger(year) || year < 1900 || year > 2100))) {
     return { httpStatus: 400, body: {
       status: "invalid_request",
       usage: "/test-comingsoon-search?title=Una%20notte%20da%20leoni&year=2009&type=film",
-      supportedTypes: ["film", "serietv"]
+      supportedTypes: ["film"]
+    }};
+  }
+  if (type !== "film") {
+    return { httpStatus: 400, body: {
+      status: "unsupported_type",
+      provider: "ComingSoon Native Search",
+      message: "La ricerca nativa per serie TV non è stata ancora verificata."
     }};
   }
 
-  const searchTerm = title + (type === "film" ? " more:film" : " more:serie_tv");
-  const searchPage = new URL("/cerca/", CS_BASE);
-  searchPage.searchParams.set("q", title);
+  const searchPage = new URL("/film/", CS_BASE);
+  searchPage.searchParams.set("titolo", title);
   const diagnostic = {
     status: "error",
-    provider: "ComingSoon Google CSE",
-    title,
-    year,
-    type,
-    query: searchTerm,
+    provider: "ComingSoon Native Film Search",
+    title, year, type,
     searchPageUrl: searchPage.href,
     searchPageHttp: null,
-    googleHttp: null,
     resultCount: 0,
     candidates: [],
     selected: null,
     message: null
   };
-
-  // Il token CSE è dinamico: recuperarlo dalla pagina anziché
-  // riutilizzare cse_tok/cookie della sessione dell'utente.
-  let html;
   try {
     const page = await fetchHtml(searchPage.href);
     diagnostic.searchPageHttp = page.http;
-    html = page.html;
-  } catch (error) {
-    diagnostic.message = "Impossibile caricare la pagina ComingSoon: " + String(error?.message || error);
-    return { httpStatus: 502, body: diagnostic };
-  }
-
-  const tokenPatterns = [
-    /["']cse_tok["']\s*:\s*["']([^"']+)["']/i,
-    /["']cse_tok["']\s*,\s*["']([^"']+)["']/i,
-    /[?&]cse_tok=([^&"'\\\s]+)/i
-  ];
-  let token = null;
-  for (const pattern of tokenPatterns) {
-    const match = html.match(pattern);
-    if (match) {
-      try { token = decodeURIComponent(match[1]); } catch { token = match[1]; }
-      break;
-    }
-  }
-
-  const endpoint = new URL("https://cse.google.com/cse/element/v1");
-  endpoint.searchParams.set("rsz", "filtered_cse");
-  endpoint.searchParams.set("num", "10");
-  endpoint.searchParams.set("hl", "it");
-  endpoint.searchParams.set("source", "gcsc");
-  endpoint.searchParams.set("cx", CS_CSE_CX);
-  endpoint.searchParams.set("q", searchTerm);
-  endpoint.searchParams.set("safe", "active");
-  endpoint.searchParams.set("filter", "0");
-  endpoint.searchParams.set("callback", "google.search.cse.api0");
-  endpoint.searchParams.set("rurl", searchPage.href);
-  if (token) endpoint.searchParams.set("cse_tok", token);
-
-  diagnostic.tokenFound = Boolean(token);
-  try {
-    const response = await fetch(endpoint.href, {
-      headers: {
-        "Accept": "application/javascript, text/javascript, */*",
-        "Accept-Language": "it-IT,it;q=0.9",
-        "Referer": CS_BASE + "/"
-      },
-      signal: AbortSignal.timeout(TIMEOUT)
-    });
-    diagnostic.googleHttp = response.status;
-    const body = await response.text();
-    if (!response.ok) {
-      diagnostic.message = "Google CSE HTTP " + response.status + ": " + body.slice(0, 200);
-      return { httpStatus: 502, body: diagnostic };
-    }
-
-    const parsed = parseCseJsonp(body);
-    if (parsed.error) {
-      diagnostic.message = "Google CSE: " + (parsed.error.message || "errore nella risposta");
-      return { httpStatus: 502, body: diagnostic };
-    }
-
-    const items = Array.isArray(parsed.results) ? parsed.results : [];
-    const candidates = items
-      .map(item => comingSoonSearchCandidate(item, type, title, year))
-      .filter(Boolean);
-    diagnostic.resultCount = items.length;
-    diagnostic.candidates = candidates;
-    diagnostic.selected = candidates.find(item => item.match) || null;
+    diagnostic.resultCount = Number(page.html.match(/data-count=["'](\d+)["']/i)?.[1] || 0);
+    diagnostic.candidates = extractNativeFilmCandidates(page.html, title, year);
+    diagnostic.selected = diagnostic.candidates.find(item => item.match) || null;
     diagnostic.status = diagnostic.selected ? "found_exact" : "no_exact_match";
     diagnostic.message = diagnostic.selected
-      ? "Scheda identificata. L'URL streaming è un candidato da verificare."
-      : "Nessuna corrispondenza esatta; nessun risultato selezionato automaticamente.";
+      ? "Scheda individuata; URL streaming candidato da verificare."
+      : "Nessuna corrispondenza esatta nel primo elenco; nessuna scheda selezionata.";
     return { httpStatus: 200, body: diagnostic };
   } catch (error) {
-    diagnostic.message = "Ricerca CSE non riuscita: " + String(error?.message || error);
+    diagnostic.message = "Ricerca nativa ComingSoon non riuscita: " + String(error?.message || error);
     return { httpStatus: 502, body: diagnostic };
   }
 }
@@ -1095,7 +1068,7 @@ export default {
 
     try {
 
-      // TEST RICERCA COMINGSOON TRAMITE GOOGLE CSE
+      // TEST RICERCA NATIVA COMINGSOON (FILM)
       if (path === "/test-comingsoon-search") {
         const result = await testComingSoonSearch(url);
         return json(result.body, result.httpStatus);
@@ -1223,7 +1196,8 @@ export default {
           testLink: "/test-comingsoon-link",
           testBatch: "/test-comingsoon-batch",
           testFilms: "/test-comingsoon-films?page=2",
-          testSeries: "/test-comingsoon-series?page=1"
+          testSeries: "/test-comingsoon-series?page=1",
+          testSearch: "/test-comingsoon-search?title=Una%20notte%20da%20leoni&year=2009&type=film"
         });
       }
 
