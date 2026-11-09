@@ -1,4 +1,4 @@
-name: Deploy NOW API test (manual)
+name: Deploy CSAPI (automatic on main)
 
 on:
   push:
