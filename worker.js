@@ -1,7 +1,7 @@
 const NOW_BASE = "https://www.nowtv.it";
 const CS_BASE = "https://www.comingsoon.it";
 
-const VERSION = "4.2";
+const VERSION = "5.0-csapi";
 const TTL = 14400;
 const CACHE_VERSION = "v4";
 const TIMEOUT = 12000;
@@ -1272,6 +1272,60 @@ async function testComingSoonSeriesSearch(url) {
   }};
 }
 
+
+function csapiNormalizePlatforms(platforms) {
+  const names = {"apple itunes":"Apple TV Store","amazon prime video":"Prime Video","timvision":"TIMVISION"};
+  return platforms.map(p => {
+    const name = names[normalize(p.name)] || p.name;
+    const offers = p.offers.map(o => {
+      let url = o.url;
+      try {
+        const parsed = new URL(url);
+        if (parsed.hostname === "primevideo-eu.pxf.io") {
+          const direct = parsed.searchParams.get("u");
+          if (direct) {
+            const target = new URL(direct);
+            if (target.protocol === "https:" && /(^|\\.)primevideo\\.com$/.test(target.hostname)) url = target.href;
+          }
+        }
+      } catch {}
+      return {type:o.type,section:o.section,label:o.label,url};
+    });
+    return {name,code:normalize(name).replace(/ /g,"_"),logo:p.logo,offers:[...new Map(offers.map(o=>[o.type+"|"+o.url,o])).values()]};
+  });
+}
+
+async function csapiSearch(url) {
+  const title = (url.searchParams.get("title") || "").trim();
+  const type = (url.searchParams.get("type") || "film").toLowerCase();
+  const yearRaw = url.searchParams.get("year");
+  const year = yearRaw ? Number(yearRaw) : null;
+  if (!title || title.length > 180 || !["film","serietv"].includes(type) ||
+      (year !== null && (!Number.isInteger(year) || year < 1900 || year > 2100))) {
+    return {httpStatus:400,body:{status:"invalid_request",provider:"CSAPI",
+      usage:"/api/search?title=Interstellar&year=2014&type=film"}};
+  }
+  const search = new URL(type === "film" ? "/film/" : "/serietv/ricerca/",CS_BASE);
+  search.searchParams.set("titolo",title);
+  if (type === "serietv" && year !== null) search.searchParams.set("anno",String(year));
+  const page = await fetchHtml(search.href);
+  const candidates = type === "film"
+    ? extractNativeFilmCandidates(page.html,title,year)
+    : csSeriesCandidates(page.html,title,year);
+  const selected = candidates.find(c=>c.match);
+  if (!selected) return {httpStatus:200,body:{status:"not_found",provider:"CSAPI",
+    title,year,type,platforms:[],message:"Nessuna corrispondenza esatta di titolo e anno."}};
+  const detail = await testComingSoonDetails(new URL("https://csapi.invalid/test-comingsoon-details?type="+type+"&url="+encodeURIComponent(selected.detailUrl)));
+  const data = detail.body;
+  if (data.streamingError) return {httpStatus:502,body:{status:"upstream_error",provider:"CSAPI",
+    title,year,type,detailUrl:selected.detailUrl,message:data.streamingError}};
+  const metadata = {...data.metadata};
+  if (metadata.image && metadata.image.includes(",")) metadata.image = metadata.image.split(",")[0].trim();
+  return {httpStatus:200,body:{status:"found_exact",provider:"CSAPI",title,year,type,
+    matchedTitle:selected.title,matchedYear:selected.year,detailUrl:selected.detailUrl,
+    metadata,platforms:csapiNormalizePlatforms(data.platforms)}};
+}
+
 // ==========================================================
 // ROUTER PRINCIPALE
 // ==========================================================
@@ -1282,6 +1336,21 @@ export default {
     const path = url.pathname;
 
     try {
+
+      if (path === "/api/search") {
+        const result = await csapiSearch(url);
+        return json(result.body, result.httpStatus);
+      }
+
+      if (path === "/api/details") {
+        const result = await testComingSoonDetails(url);
+        if (result.httpStatus !== 200) return json(result.body,result.httpStatus);
+        const data = result.body;
+        const metadata = {...data.metadata};
+        if (metadata.image && metadata.image.includes(",")) metadata.image = metadata.image.split(",")[0].trim();
+        return json({status:data.streamingError ? "upstream_error":"ok",provider:"CSAPI",type:data.kind,detailUrl:data.detailUrl,metadata,
+          platforms:csapiNormalizePlatforms(data.platforms),error:data.streamingError},data.streamingError ? 502 : 200);
+      }
 
       if (path === "/test-comingsoon-details") {
         const result = await testComingSoonDetails(url);
@@ -1401,86 +1470,15 @@ export default {
         );
       }
 
-      // --------------------------------------------------
-      // CATALOGO UFFICIALE NOW
-      // --------------------------------------------------
-
-      const title = url.searchParams
-        .get("title")
-        ?.trim();
-
-      if (!title && path !== "/stats") {
-        return json({
-          status: "ready",
-          version: VERSION,
-          provider: "NOW",
-          usage: "/?title=Chicago%20P.D.",
-          stats: "/stats",
-          testNow: "/test-now-collection",
-          testComingSoon: "/test-comingsoon",
-          testLink: "/test-comingsoon-link",
-          testBatch: "/test-comingsoon-batch",
-          testFilms: "/test-comingsoon-films?page=2",
-          testSeries: "/test-comingsoon-series?page=1",
-          testSearch: "/test-comingsoon-search?title=Una%20notte%20da%20leoni&year=2009&type=film",
-          testSeriesSearch: "/test-comingsoon-series-search?title=Breaking%20Bad&year=2008",
-          testDetails: "/test-comingsoon-details?type=film&url=https%3A%2F%2Fwww.comingsoon.it%2Ffilm%2Funa-notte-da-leoni%2F47321%2Fscheda%2F"
-        });
-      }
-
-      const {
-        catalog,
-        cacheStatus
-      } = await getNowCatalog(request);
-
-      // --------------------------------------------------
-      // STATISTICHE
-      // --------------------------------------------------
-
-      if (path === "/stats") {
-        return json({
-          status: "ok",
-          provider: "NOW",
-          cache: cacheStatus,
-          updatedAt: catalog.updatedAt,
-          ...catalog.stats
-        });
-      }
-
-      // --------------------------------------------------
-      // RICERCA TITOLO UFFICIALE NOW
-      // --------------------------------------------------
-
-      const query = normalize(title);
-
-      const matches = catalog.items.filter(
-        item =>
-          item.normalizedTitle === query &&
-          isActive(item)
-      );
-
-      return json({
-        status: matches.length
-          ? "found_exact"
-          : "not_found",
-        provider: "NOW",
-        query: title,
-        catalogCount: catalog.count,
-        cache: cacheStatus,
-        updatedAt: catalog.updatedAt,
-        matches: matches.map(item => ({
-          title: item.title,
-          type: item.type,
-          url: item.url,
-          contentId: item.contentId,
-          source: item.source
-        }))
-      });
+      return json({status:"ready",provider:"CSAPI",version:VERSION,
+        search:"/api/search?title=Interstellar&year=2014&type=film",
+        details:"/api/details?type=film&url=https%3A%2F%2Fwww.comingsoon.it%2Ffilm%2Finterstellar%2F49750%2Fscheda%2F",
+        legacyDiagnostics:true},path === "/" ? 200 : 404);
 
     } catch (error) {
       return json({
         status: "error",
-        provider: "NOW API Test v4.2",
+        provider: "CSAPI",
         message: String(
           error?.message || error
         )
