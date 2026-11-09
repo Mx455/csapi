@@ -1285,7 +1285,7 @@ function csapiNormalizePlatforms(platforms) {
           const direct = parsed.searchParams.get("u");
           if (direct) {
             const target = new URL(direct);
-            if (target.protocol === "https:" && /(^|\\.)primevideo\\.com$/.test(target.hostname)) url = target.href;
+            if (target.protocol === "https:" && /(^|\.)primevideo\.com$/.test(target.hostname)) url = target.href;
           }
         }
       } catch {}
