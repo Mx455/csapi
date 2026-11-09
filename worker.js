@@ -918,6 +918,172 @@ async function testComingSoonLink() {
   };
 }
 
+
+// ==========================================================
+// COMINGSOON - DIAGNOSTICA RICERCA INTERNA GOOGLE CSE
+// Endpoint sperimentale: non modifica i test NOW esistenti.
+// ==========================================================
+
+const CS_CSE_CX = "001228879720830619245:WMX2023538107";
+
+function parseCseJsonp(body) {
+  const start = body.indexOf("(");
+  const end = body.lastIndexOf(")");
+  if (start < 0 || end <= start) {
+    throw new Error("Risposta CSE non riconosciuta (JSONP)");
+  }
+  return JSON.parse(body.slice(start + 1, end));
+}
+
+function comingSoonSearchCandidate(item, type, title, year) {
+  const candidateUrl = item.unescapedUrl || item.url || "";
+  let parsed;
+  try {
+    parsed = new URL(candidateUrl);
+  } catch {
+    return null;
+  }
+
+  if (parsed.hostname !== "www.comingsoon.it") return null;
+  if (type === "film" && !/^\/film\/[^/]+\/\d+\/scheda\/?$/i.test(parsed.pathname)) return null;
+  if (type === "serietv" && !/^\/(?:serietv|serie-tv)\/[^/]+\/\d+\/scheda\/?$/i.test(parsed.pathname)) return null;
+
+  const resultTitle = cleanText(item.titleNoFormatting || item.title || "");
+  const yearMatch = resultTitle.match(/\((19\d{2}|20\d{2})\)/);
+  const resultYear = yearMatch ? Number(yearMatch[1]) : null;
+  const cleanTitle = resultTitle
+    .replace(/\s*-\s*(?:Film|Serie TV|Serie Televisiva)\b.*$/i, "")
+    .trim();
+  const exactTitle = normalize(cleanTitle) === normalize(title);
+  const yearMatches = year === null || resultYear === year;
+  const id = parsed.pathname.match(/\/(\d+)\/scheda\/?$/)?.[1] || null;
+
+  return {
+    title: cleanTitle,
+    year: resultYear,
+    id,
+    detailUrl: parsed.href,
+    streamingUrl: parsed.href.replace(/\/scheda\/?$/i, "/streaming/"),
+    exactTitle,
+    yearMatches,
+    match: exactTitle && yearMatches
+  };
+}
+
+async function testComingSoonSearch(url) {
+  const title = (url.searchParams.get("title") || "").trim();
+  const type = (url.searchParams.get("type") || "film").toLowerCase();
+  const yearText = url.searchParams.get("year");
+  const year = yearText ? Number(yearText) : null;
+
+  if (!title || title.length > 180 || !["film", "serietv"].includes(type) ||
+      (year !== null && (!Number.isInteger(year) || year < 1900 || year > 2100))) {
+    return { httpStatus: 400, body: {
+      status: "invalid_request",
+      usage: "/test-comingsoon-search?title=Una%20notte%20da%20leoni&year=2009&type=film",
+      supportedTypes: ["film", "serietv"]
+    }};
+  }
+
+  const searchTerm = title + (type === "film" ? " more:film" : " more:serie_tv");
+  const searchPage = new URL("/cerca/", CS_BASE);
+  searchPage.searchParams.set("q", title);
+  const diagnostic = {
+    status: "error",
+    provider: "ComingSoon Google CSE",
+    title,
+    year,
+    type,
+    query: searchTerm,
+    searchPageUrl: searchPage.href,
+    searchPageHttp: null,
+    googleHttp: null,
+    resultCount: 0,
+    candidates: [],
+    selected: null,
+    message: null
+  };
+
+  // Il token CSE è dinamico: recuperarlo dalla pagina anziché
+  // riutilizzare cse_tok/cookie della sessione dell'utente.
+  let html;
+  try {
+    const page = await fetchHtml(searchPage.href);
+    diagnostic.searchPageHttp = page.http;
+    html = page.html;
+  } catch (error) {
+    diagnostic.message = "Impossibile caricare la pagina ComingSoon: " + String(error?.message || error);
+    return { httpStatus: 502, body: diagnostic };
+  }
+
+  const tokenPatterns = [
+    /["']cse_tok["']\s*:\s*["']([^"']+)["']/i,
+    /["']cse_tok["']\s*,\s*["']([^"']+)["']/i,
+    /[?&]cse_tok=([^&"'\\\s]+)/i
+  ];
+  let token = null;
+  for (const pattern of tokenPatterns) {
+    const match = html.match(pattern);
+    if (match) {
+      try { token = decodeURIComponent(match[1]); } catch { token = match[1]; }
+      break;
+    }
+  }
+
+  const endpoint = new URL("https://cse.google.com/cse/element/v1");
+  endpoint.searchParams.set("rsz", "filtered_cse");
+  endpoint.searchParams.set("num", "10");
+  endpoint.searchParams.set("hl", "it");
+  endpoint.searchParams.set("source", "gcsc");
+  endpoint.searchParams.set("cx", CS_CSE_CX);
+  endpoint.searchParams.set("q", searchTerm);
+  endpoint.searchParams.set("safe", "active");
+  endpoint.searchParams.set("filter", "0");
+  endpoint.searchParams.set("callback", "google.search.cse.api0");
+  endpoint.searchParams.set("rurl", searchPage.href);
+  if (token) endpoint.searchParams.set("cse_tok", token);
+
+  diagnostic.tokenFound = Boolean(token);
+  try {
+    const response = await fetch(endpoint.href, {
+      headers: {
+        "Accept": "application/javascript, text/javascript, */*",
+        "Accept-Language": "it-IT,it;q=0.9",
+        "Referer": CS_BASE + "/"
+      },
+      signal: AbortSignal.timeout(TIMEOUT)
+    });
+    diagnostic.googleHttp = response.status;
+    const body = await response.text();
+    if (!response.ok) {
+      diagnostic.message = "Google CSE HTTP " + response.status + ": " + body.slice(0, 200);
+      return { httpStatus: 502, body: diagnostic };
+    }
+
+    const parsed = parseCseJsonp(body);
+    if (parsed.error) {
+      diagnostic.message = "Google CSE: " + (parsed.error.message || "errore nella risposta");
+      return { httpStatus: 502, body: diagnostic };
+    }
+
+    const items = Array.isArray(parsed.results) ? parsed.results : [];
+    const candidates = items
+      .map(item => comingSoonSearchCandidate(item, type, title, year))
+      .filter(Boolean);
+    diagnostic.resultCount = items.length;
+    diagnostic.candidates = candidates;
+    diagnostic.selected = candidates.find(item => item.match) || null;
+    diagnostic.status = diagnostic.selected ? "found_exact" : "no_exact_match";
+    diagnostic.message = diagnostic.selected
+      ? "Scheda identificata. L'URL streaming è un candidato da verificare."
+      : "Nessuna corrispondenza esatta; nessun risultato selezionato automaticamente.";
+    return { httpStatus: 200, body: diagnostic };
+  } catch (error) {
+    diagnostic.message = "Ricerca CSE non riuscita: " + String(error?.message || error);
+    return { httpStatus: 502, body: diagnostic };
+  }
+}
+
 // ==========================================================
 // ROUTER PRINCIPALE
 // ==========================================================
@@ -928,6 +1094,12 @@ export default {
     const path = url.pathname;
 
     try {
+
+      // TEST RICERCA COMINGSOON TRAMITE GOOGLE CSE
+      if (path === "/test-comingsoon-search") {
+        const result = await testComingSoonSearch(url);
+        return json(result.body, result.httpStatus);
+      }
 
       // --------------------------------------------------
       // TEST COLLEZIONE UFFICIALE NOW
