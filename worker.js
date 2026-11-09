@@ -752,6 +752,60 @@ function extractNowLinks(html) {
 }
 
 // ==========================================================
+// COMINGSOON - TUTTE LE PIATTAFORME STREAMING
+// ==========================================================
+
+function extractStreamingPlatforms(html) {
+  const platforms = [];
+  const rows = [...html.matchAll(/<tr\b[^>]*>[\s\S]*?<\/tr>/gi)];
+  for (const match of rows) {
+    const row = match[0];
+    const header = row.match(/<th\b[^>]*>[\s\S]*?<\/th>/i)?.[0];
+    if (!header) continue;
+    const providerAnchor = [...header.matchAll(/<a\b[^>]*>/gi)]
+      .map(x => x[0]).find(x => getAttr(x, "data-ref")) || null;
+    const providerCode = providerAnchor ? getAttr(providerAnchor, "data-ref") : null;
+    const logoTag = header.match(/<img\b[^>]*>/i)?.[0];
+    const logoRaw = logoTag && (getAttr(logoTag, "data-src") || getAttr(logoTag, "src"));
+    let logo = null;
+    try {
+      const u = new URL(logoRaw, CS_BASE);
+      if (u.protocol === "https:") logo = u.href;
+    } catch {}
+    const providerName = cleanText(header).replace(/\s+/g," ").trim() ||
+      (logoTag ? getAttr(logoTag,"alt") : null) || providerCode;
+    if (!providerName && !providerCode) continue;
+    const offers = [];
+    for (const cellMatch of row.matchAll(/<td\b[^>]*>[\s\S]*?<\/td>/gi)) {
+      const cell = cellMatch[0];
+      const tag = cell.match(/^<td\b[^>]*>/i)?.[0];
+      const column = getAttr(tag || "", "data-th");
+      const mode = OFFER_MODES[normalize(column)];
+      if (!mode) continue;
+      for (const anchorMatch of cell.matchAll(/<a\b[^>]*>/gi)) {
+        const anchor = anchorMatch[0];
+        const href = getAttr(anchor, "href");
+        if (!href) continue;
+        let target;
+        try {
+          target = new URL(href, CS_BASE);
+          if (!["http:","https:"].includes(target.protocol)) continue;
+        } catch { continue; }
+        // Non attribuire disponibilità a link di navigazione interni.
+        if (target.hostname.endsWith("comingsoon.it") &&
+            !hasClass(anchor,"vodTrack")) continue;
+        offers.push({type:mode.type,section:mode.section,label:column,
+          url:target.href,linkText:cleanText(anchorMatch[0] + cell.slice(cell.indexOf(anchorMatch[0])+anchorMatch[0].length).split("</a>")[0])});
+      }
+    }
+    if (!offers.length) continue;
+    const unique = [...new Map(offers.map(x=>[x.type+"|"+x.url,x])).values()];
+    platforms.push({name:providerName,code:providerCode,logo,offers:unique});
+  }
+  return platforms;
+}
+
+// ==========================================================
 // COMINGSOON - SCANSIONE PAGINA
 // ==========================================================
 
@@ -1180,11 +1234,12 @@ async function testComingSoonDetails(url) {
   const streamingUrl = target.href.replace(/\/scheda\/?$/i, "/streaming/");
   const response = {status:"ok",provider:"ComingSoon",kind,
     detailUrl:target.href,detailHttp:page.http,streamingUrl,
-    metadata:csMetadata(page.html,kind),streamingHttp:null,nowOffers:[],streamingError:null};
+    metadata:csMetadata(page.html,kind),streamingHttp:null,nowOffers:[],platforms:[],streamingError:null};
   try {
     const streaming = await fetchHtml(streamingUrl);
     response.streamingHttp = streaming.http;
     response.nowOffers = extractNowLinks(streaming.html).offers;
+    response.platforms = extractStreamingPlatforms(streaming.html);
   } catch(e) {
     response.streamingError = String(e?.message || e);
   }
