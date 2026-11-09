@@ -1058,6 +1058,156 @@ async function testComingSoonSearch(url) {
 }
 
 // ==========================================================
+// COMINGSOON - METADATI E DIAGNOSTICA SERIE TV
+// Nessun trailer ComingSoon viene acquisito.
+// ==========================================================
+
+function csMetaContent(html, key, value) {
+  for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
+    if ((getAttr(match[0], key) || "").toLowerCase() === value.toLowerCase()) {
+      return getAttr(match[0], "content") || null;
+    }
+  }
+  return null;
+}
+
+function csJsonLd(html) {
+  const items = [];
+  for (const match of html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      const walk = value => {
+        if (!value || typeof value !== "object") return;
+        if (Array.isArray(value)) { value.forEach(walk); return; }
+        if (value["@graph"]) walk(value["@graph"]);
+        items.push(value);
+      };
+      walk(parsed);
+    } catch {}
+  }
+  return items;
+}
+
+function csMetadata(html, kind) {
+  const types = kind === "film" ? ["Movie"] : ["TVSeries", "TVShow", "Series"];
+  const item = csJsonLd(html).find(x =>
+    types.some(type => [x["@type"]].flat().includes(type))
+  ) || {};
+  const description = cleanText(item.description ||
+    csMetaContent(html, "name", "description") ||
+    csMetaContent(html, "property", "og:description") || "");
+  const rawImage = typeof item.image === "string" ? item.image :
+    (item.image?.url || csMetaContent(html, "property", "og:image"));
+  let image = null;
+  try {
+    if (rawImage) {
+      const u = new URL(rawImage, CS_BASE);
+      if (u.protocol === "https:") image = u.href;
+    }
+  } catch {}
+  const genres = Array.isArray(item.genre) ? item.genre :
+    (typeof item.genre === "string" ? [item.genre] : []);
+  const seasons = Number(item.numberOfSeasons);
+  return {
+    title: cleanText(item.name || csMetaContent(html, "property", "og:title") || "") || null,
+    description: description || null,
+    image,
+    genres,
+    numberOfSeasons: Number.isInteger(seasons) && seasons > 0 ? seasons : null,
+    metadataSource: Object.keys(item).length ? "jsonld" : "meta",
+    trailer: null
+  };
+}
+
+function csSeriesCandidates(html, title, year) {
+  const candidates = [];
+  const seen = new Set();
+  // Diagnostic: accept only real series detail URLs, never article or news URLs.
+  const anchors = [...html.matchAll(/<a\b[^>]*href=["'][^"']*\/serietv\/[^"']+\/scheda\/?["'][^>]*>/gi)];
+  for (const anchor of anchors) {
+    const href = getAttr(anchor[0], "href");
+    let parsed;
+    try { parsed = new URL(href, CS_BASE); } catch { continue; }
+    if (parsed.hostname !== "www.comingsoon.it" ||
+      !/^\/serietv\/[^/]+\/\d+\/scheda\/?$/i.test(parsed.pathname) ||
+      seen.has(parsed.pathname)) continue;
+    seen.add(parsed.pathname);
+    const context = html.slice(anchor.index, Math.min(html.length, anchor.index + 3500));
+    const titleMatch = context.match(/<div\b[^>]*class=["'][^"']*\btitolo\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+    const label = titleMatch ? cleanText(titleMatch[1]) :
+      cleanText(context.match(/<h[234]\b[^>]*>([\s\S]*?)<\/h[234]>/i)?.[1] || "");
+    const yearMatch = context.match(/(?:Anno\s*:?\s*(?:<\/[^>]+>\s*)*)\b(19\d{2}|20\d{2})\b/i);
+    const foundYear = yearMatch ? Number(yearMatch[1]) : null;
+    const exactTitle = normalize(label) === normalize(title);
+    const yearMatches = year === null || foundYear === year;
+    candidates.push({
+      title: label || null, year: foundYear,
+      id: parsed.pathname.match(/\/(\d+)\/scheda\/?$/)?.[1] || null,
+      detailUrl: parsed.href,
+      streamingUrl: parsed.href.replace(/\/scheda\/?$/i, "/streaming/"),
+      exactTitle, yearMatches, match: exactTitle && yearMatches
+    });
+  }
+  return candidates;
+}
+
+async function testComingSoonDetails(url) {
+  const kind = (url.searchParams.get("type") || "film").toLowerCase();
+  const raw = url.searchParams.get("url");
+  if (!["film", "serietv"].includes(kind) || !raw) {
+    return { httpStatus: 400, body: {status:"invalid_request",
+      usage:"/test-comingsoon-details?type=film&url=https%3A%2F%2Fwww.comingsoon.it%2Ffilm%2Funa-notte-da-leoni%2F47321%2Fscheda%2F"} };
+  }
+  let target;
+  try {
+    target = new URL(raw);
+    const prefix = kind === "film" ? "film" : "serietv";
+    if (target.protocol !== "https:" || target.hostname !== "www.comingsoon.it" ||
+      !new RegExp("^/" + prefix + "/[^/]+/\\d+/scheda/?$", "i").test(target.pathname) ||
+      target.search || target.hash) throw Error("Invalid target");
+  } catch {
+    return {httpStatus:400,body:{status:"invalid_url",message:"Solo URL scheda ComingSoon del tipo selezionato."}};
+  }
+  const page = await fetchHtml(target.href);
+  const streamingUrl = target.href.replace(/\/scheda\/?$/i, "/streaming/");
+  const response = {status:"ok",provider:"ComingSoon",kind,
+    detailUrl:target.href,detailHttp:page.http,streamingUrl,
+    metadata:csMetadata(page.html,kind),streamingHttp:null,nowOffers:[],streamingError:null};
+  try {
+    const streaming = await fetchHtml(streamingUrl);
+    response.streamingHttp = streaming.http;
+    response.nowOffers = extractNowLinks(streaming.html).offers;
+  } catch(e) {
+    response.streamingError = String(e?.message || e);
+  }
+  return {httpStatus:200,body:response};
+}
+
+async function testComingSoonSeriesSearch(url) {
+  const title = (url.searchParams.get("title") || "").trim();
+  const yearText = url.searchParams.get("year");
+  const year = yearText ? Number(yearText) : null;
+  if (!title || title.length > 180 ||
+    (year !== null && (!Number.isInteger(year) || year < 1900 || year > 2100))) {
+    return {httpStatus:400,body:{status:"invalid_request",
+      usage:"/test-comingsoon-series-search?title=Breaking%20Bad&year=2008"}};
+  }
+  const search = new URL("/serietv/ricerca/", CS_BASE);
+  search.searchParams.set("titolo", title);
+  const page = await fetchHtml(search.href);
+  const candidates = csSeriesCandidates(page.html,title,year);
+  const selected = candidates.find(x => x.match) || null;
+  return {httpStatus:200,body:{
+    status:selected ? "found_exact" : "unverified_search",
+    provider:"ComingSoon Native Series Search (diagnostic)",
+    title,year,searchPageUrl:search.href,searchPageHttp:page.http,
+    htmlLength:page.html.length,candidates,selected,
+    message:selected ? "Corrispondenza esatta trovata; verificare la scheda." :
+      "Parametri o struttura HTML della ricerca serie da verificare. Nessuna associazione automatica."
+  }};
+}
+
+// ==========================================================
 // ROUTER PRINCIPALE
 // ==========================================================
 
@@ -1067,6 +1217,16 @@ export default {
     const path = url.pathname;
 
     try {
+
+      if (path === "/test-comingsoon-details") {
+        const result = await testComingSoonDetails(url);
+        return json(result.body, result.httpStatus);
+      }
+
+      if (path === "/test-comingsoon-series-search") {
+        const result = await testComingSoonSeriesSearch(url);
+        return json(result.body, result.httpStatus);
+      }
 
       // TEST RICERCA NATIVA COMINGSOON (FILM)
       if (path === "/test-comingsoon-search") {
@@ -1197,7 +1357,9 @@ export default {
           testBatch: "/test-comingsoon-batch",
           testFilms: "/test-comingsoon-films?page=2",
           testSeries: "/test-comingsoon-series?page=1",
-          testSearch: "/test-comingsoon-search?title=Una%20notte%20da%20leoni&year=2009&type=film"
+          testSearch: "/test-comingsoon-search?title=Una%20notte%20da%20leoni&year=2009&type=film",
+          testSeriesSearch: "/test-comingsoon-series-search?title=Breaking%20Bad&year=2008",
+          testDetails: "/test-comingsoon-details?type=film&url=https%3A%2F%2Fwww.comingsoon.it%2Ffilm%2Funa-notte-da-leoni%2F47321%2Fscheda%2F"
         });
       }
 
