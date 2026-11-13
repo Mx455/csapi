@@ -371,6 +371,7 @@ async function csapiSearch(url) {
 export default {
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/") return Response.redirect("https://tvstasera.online/", 302);
     try {
       if (url.pathname === "/api/search") {
         const result = await csapiSearch(url);
